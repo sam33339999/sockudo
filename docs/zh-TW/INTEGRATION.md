@@ -590,26 +590,21 @@ Echo.join('presence.room.1')
 
 當前端透過 `pusher-js` 訂閱 `private-*` 或 `presence-*` 頻道時，會觸發以下流程：
 
-```
-前端 (pusher-js)                  Laravel 後端                     Sockudo
-      |                                |                              |
-      |-- subscribe('private-xxx') --> |                              |
-      |                                |                              |
-      |-- POST /broadcasting/auth ---> |                              |
-      |   {socket_id, channel_name}    |                              |
-      |                                |-- 驗證使用者權限 ------------> |
-      |                                |-- 計算 HMAC-SHA256 簽名 ----> |
-      |                                |                              |
-      | <---- {auth: "key:sig"} -------|                              |
-      |                                                               |
-      |-- pusher:subscribe {channel, auth} -------------------------> |
-      |                                                  驗證簽名：    |
-      |                                     expected = HMAC-SHA256(   |
-      |                                       app_secret,            |
-      |                                       "{socket_id}:{channel}"|
-      |                                     )                         |
-      |                                     比對 auth 中的 sig        |
-      | <-------- subscription_succeeded -----------------------------|
+```mermaid
+sequenceDiagram
+    participant C as 前端 (pusher-js)
+    participant L as Laravel 後端
+    participant S as Sockudo
+
+    C->>C: subscribe('private-xxx')
+    C->>L: POST /broadcasting/auth {socket_id, channel_name}
+    Note over L: 驗證使用者權限（session/token）
+    Note over L: 計算簽名 = HMAC-SHA256(app_secret, "{socket_id}:{channel}")
+    L->>C: {auth: "app-key:簽名"}
+    C->>S: pusher:subscribe {channel, auth}
+    Note over S: 驗證簽名：expected = HMAC-SHA256(app_secret, "{socket_id}:{channel}")
+    Note over S: 比對 auth 中的簽名（timing-safe comparison）
+    S->>C: pusher_internal:subscription_succeeded
 ```
 
 **簽名格式**（基於 Sockudo 原始碼 `src/channel/manager.rs` 與 `src/token.rs`）：
@@ -864,7 +859,7 @@ chatChannel.listenForWhisper('typing', (e) => {
 });
 ```
 
-> **注意**：`whisper()` 是 Laravel Echo 對 Pusher client event 的封裝。它會發送 `client-typing` 事件。這需要 Sockudo 的 App 配置中 `enable_client_messages: true`。
+> **注意**：`whisper()` 是 Laravel Echo 對 Pusher client event 的封裝。它會發送以 `client-` 為前綴的事件（如此處的 `client-typing`，名稱由 `whisper()` 的第一個參數決定）。這需要 Sockudo 的 App 配置中 `enable_client_messages: true`。
 
 ---
 
