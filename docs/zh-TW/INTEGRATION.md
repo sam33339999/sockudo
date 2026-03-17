@@ -11,6 +11,7 @@
 - [1. Golang 整合](#1-golang-整合)
 - [2. PHP 整合](#2-php-整合)
 - [3. Laravel 整合](#3-laravel-整合)
+  - [3.1 Laravel Private / Presence Channel 深入教學](#31-laravel-private--presence-channel-深入教學)
 - [4. Rust 整合](#4-rust-整合)
 - [5. 認證端點實作](#5-認證端點實作)
 - [6. 前端客戶端（所有語言通用）](#6-前端客戶端所有語言通用)
@@ -578,6 +579,581 @@ Echo.join('presence.room.1')
         console.log('新訊息:', e);
     });
 ```
+
+---
+
+### 3.1 Laravel Private / Presence Channel 深入教學
+
+本節深入說明 Laravel 如何與 Sockudo 配合實現**私有頻道**（Private Channel）與 **Presence 頻道**的完整流程，包括認證原理、實際情境範例與疑難排解。
+
+#### 認證原理：Sockudo 如何驗證頻道訂閱
+
+當前端透過 `pusher-js` 訂閱 `private-*` 或 `presence-*` 頻道時，會觸發以下流程：
+
+```
+前端 (pusher-js)                  Laravel 後端                     Sockudo
+      |                                |                              |
+      |-- subscribe('private-xxx') --> |                              |
+      |                                |                              |
+      |-- POST /broadcasting/auth ---> |                              |
+      |   {socket_id, channel_name}    |                              |
+      |                                |-- 驗證使用者權限 ------------> |
+      |                                |-- 計算 HMAC-SHA256 簽名 ----> |
+      |                                |                              |
+      | <---- {auth: "key:sig"} -------|                              |
+      |                                                               |
+      |-- pusher:subscribe {channel, auth} -------------------------> |
+      |                                                  驗證簽名：    |
+      |                                     expected = HMAC-SHA256(   |
+      |                                       app_secret,            |
+      |                                       "{socket_id}:{channel}"|
+      |                                     )                         |
+      |                                     比對 auth 中的 sig        |
+      | <-------- subscription_succeeded -----------------------------|
+```
+
+**簽名格式**（基於 Sockudo 原始碼 `src/channel/manager.rs` 與 `src/token.rs`）：
+
+| 頻道類型 | 簽名字串格式 | 回傳格式 |
+|----------|-------------|----------|
+| Private | `{socket_id}:{channel_name}` | `{"auth": "{app_key}:{hmac_hex}"}` |
+| Presence | `{socket_id}:{channel_name}:{channel_data}` | `{"auth": "{app_key}:{hmac_hex}", "channel_data": "..."}` |
+| Private Encrypted | `{socket_id}:{channel_name}` | `{"auth": "{app_key}:{hmac_hex}", "shared_secret": "..."}` |
+
+其中 `hmac_hex = HMAC-SHA256(app_secret, 簽名字串)` 以十六進位編碼輸出，使用 timing-safe 比對驗證。
+
+---
+
+#### 範例 1：Private Channel — 使用者專屬通知
+
+**情境**：每個使用者有自己的通知頻道 `private-user.{id}`，只有本人可訂閱。
+
+**步驟 A：定義 Event**
+
+```php
+<?php
+
+namespace App\Events;
+
+use App\Models\User;
+use Illuminate\Broadcasting\PrivateChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Foundation\Events\Dispatchable;
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Queue\SerializesModels;
+
+class UserNotification implements ShouldBroadcast
+{
+    use Dispatchable, InteractsWithSockets, SerializesModels;
+
+    public function __construct(
+        public int $userId,
+        public string $title,
+        public string $body,
+        public string $type = 'info',  // info, warning, error
+    ) {}
+
+    /**
+     * 廣播到該使用者的私有頻道
+     * Laravel 會自動加上 "private-" 前綴
+     */
+    public function broadcastOn(): array
+    {
+        return [
+            new PrivateChannel("user.{$this->userId}"),
+        ];
+    }
+
+    public function broadcastAs(): string
+    {
+        return 'notification';
+    }
+
+    public function broadcastWith(): array
+    {
+        return [
+            'title' => $this->title,
+            'body' => $this->body,
+            'type' => $this->type,
+            'created_at' => now()->toISOString(),
+        ];
+    }
+}
+```
+
+**步驟 B：設定頻道授權**
+
+在 `routes/channels.php` 中：
+
+```php
+<?php
+
+use Illuminate\Support\Facades\Broadcast;
+
+/*
+ * Private Channel 授權
+ *
+ * 回呼函式接收目前已登入的 $user 和路由參數。
+ * 返回 true 表示允許訂閱，返回 false 表示拒絕。
+ *
+ * 當 Laravel 收到 POST /broadcasting/auth 請求時：
+ * 1. 透過 session/token 驗證使用者身份
+ * 2. 呼叫此回呼函式檢查權限
+ * 3. 如果允許 → 用 app_secret 計算 HMAC-SHA256 簽名回傳
+ * 4. 如果拒絕 → 回傳 403 Forbidden
+ */
+Broadcast::channel('user.{userId}', function ($user, $userId) {
+    // 只允許使用者訂閱自己的頻道
+    return (int) $user->id === (int) $userId;
+});
+```
+
+**步驟 C：觸發事件**
+
+```php
+// 在 Controller 或 Service 中
+use App\Events\UserNotification;
+
+// 發送通知給特定使用者
+event(new UserNotification(
+    userId: $user->id,
+    title: '訂單已出貨',
+    body: '您的訂單 #12345 已出貨，預計明天到達。',
+    type: 'info',
+));
+```
+
+**步驟 D：前端監聽**
+
+```javascript
+// 使用 Laravel Echo
+// Echo.private() 會自動：
+// 1. 呼叫 POST /broadcasting/auth 取得簽名
+// 2. 用簽名向 Sockudo 訂閱 private-user.{id}
+Echo.private(`user.${userId}`)
+    .listen('.notification', (e) => {
+        showToast(e.title, e.body, e.type);
+    });
+```
+
+---
+
+#### 範例 2：Private Channel — 聊天室
+
+**情境**：兩個使用者之間的一對一私聊，頻道名稱為 `private-chat.{roomId}`。
+
+**步驟 A：定義 Event**
+
+```php
+<?php
+
+namespace App\Events;
+
+use App\Models\Message;
+use Illuminate\Broadcasting\PrivateChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Foundation\Events\Dispatchable;
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Queue\SerializesModels;
+
+class ChatMessageSent implements ShouldBroadcast
+{
+    use Dispatchable, InteractsWithSockets, SerializesModels;
+
+    public function __construct(
+        public Message $message,
+    ) {}
+
+    public function broadcastOn(): array
+    {
+        return [
+            new PrivateChannel("chat.{$this->message->room_id}"),
+        ];
+    }
+
+    public function broadcastAs(): string
+    {
+        return 'message.sent';
+    }
+
+    public function broadcastWith(): array
+    {
+        return [
+            'id' => $this->message->id,
+            'user_id' => $this->message->user_id,
+            'user_name' => $this->message->user->name,
+            'content' => $this->message->content,
+            'created_at' => $this->message->created_at->toISOString(),
+        ];
+    }
+}
+```
+
+**步驟 B：頻道授權 — 檢查使用者是否為聊天室成員**
+
+```php
+// routes/channels.php
+
+Broadcast::channel('chat.{roomId}', function ($user, $roomId) {
+    // 查詢使用者是否為此聊天室的成員
+    return \App\Models\ChatRoom::where('id', $roomId)
+        ->whereHas('members', function ($query) use ($user) {
+            $query->where('user_id', $user->id);
+        })
+        ->exists();
+});
+```
+
+**步驟 C：Controller**
+
+```php
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Events\ChatMessageSent;
+use App\Models\ChatRoom;
+use App\Models\Message;
+use Illuminate\Http\Request;
+
+class ChatController extends Controller
+{
+    public function sendMessage(Request $request, ChatRoom $room)
+    {
+        // 確認使用者是成員（Policy 或 middleware）
+        $this->authorize('sendMessage', $room);
+
+        $request->validate([
+            'content' => 'required|string|max:5000',
+        ]);
+
+        $message = Message::create([
+            'room_id' => $room->id,
+            'user_id' => auth()->id(),
+            'content' => $request->content,
+        ]);
+
+        $message->load('user');
+
+        // 廣播給聊天室中的其他人
+        broadcast(new ChatMessageSent($message))->toOthers();
+
+        return response()->json($message);
+    }
+}
+```
+
+**步驟 D：前端**
+
+```javascript
+// 訂閱聊天室頻道
+const chatChannel = Echo.private(`chat.${roomId}`);
+
+// 監聽新訊息
+chatChannel.listen('.message.sent', (e) => {
+    appendMessage(e);
+});
+
+// 使用 client event 顯示「對方正在輸入」
+// 注意：需在 Sockudo 的 App 配置中設定 enable_client_messages: true
+chatChannel.whisper('typing', { user: currentUser.name });
+
+// 監聽對方的輸入狀態
+chatChannel.listenForWhisper('typing', (e) => {
+    showTypingIndicator(e.user);
+});
+```
+
+> **注意**：`whisper()` 是 Laravel Echo 對 Pusher client event 的封裝。它會發送 `client-typing` 事件。這需要 Sockudo 的 App 配置中 `enable_client_messages: true`。
+
+---
+
+#### 範例 3：Presence Channel — 在線使用者列表
+
+**情境**：顯示聊天室中誰在線上，即時更新上線/離線狀態。
+
+**步驟 A：定義 Event（可選，Presence 頻道本身就有成員事件）**
+
+Presence 頻道的成員加入/離開事件由 Sockudo 自動管理，**不需要額外定義 Event 類別**。但你仍可以在 Presence 頻道上廣播自訂事件：
+
+```php
+<?php
+
+namespace App\Events;
+
+use Illuminate\Broadcasting\PresenceChannel;
+use Illuminate\Contracts\Broadcasting\ShouldBroadcast;
+use Illuminate\Foundation\Events\Dispatchable;
+use Illuminate\Broadcasting\InteractsWithSockets;
+use Illuminate\Queue\SerializesModels;
+
+class UserStatusChanged implements ShouldBroadcast
+{
+    use Dispatchable, InteractsWithSockets, SerializesModels;
+
+    public function __construct(
+        public int $roomId,
+        public int $userId,
+        public string $status,  // 'online', 'away', 'busy'
+    ) {}
+
+    public function broadcastOn(): array
+    {
+        return [
+            new PresenceChannel("room.{$this->roomId}"),
+        ];
+    }
+
+    public function broadcastAs(): string
+    {
+        return 'status.changed';
+    }
+}
+```
+
+**步驟 B：頻道授權 — 返回使用者資訊**
+
+Presence 頻道的授權回呼與 Private 不同：**返回陣列**（使用者資料）表示授權成功，返回 `false` 表示拒絕。
+
+```php
+// routes/channels.php
+
+/*
+ * Presence Channel 授權
+ *
+ * 返回值的差異：
+ * - Private Channel: 返回 true/false
+ * - Presence Channel: 返回 array（使用者資料）或 false
+ *
+ * 返回的陣列會成為 channel_data 中的 user_info，
+ * Laravel 會自動加入 user_id 欄位。
+ *
+ * Sockudo 收到訂閱時，簽名字串格式為：
+ *   "{socket_id}:presence-room.{roomId}:{channel_data_json}"
+ * 其中 channel_data_json = {"user_id":"123","user_info":{"name":"Alice",...}}
+ */
+Broadcast::channel('room.{roomId}', function ($user, $roomId) {
+    if ($user->canAccessRoom($roomId)) {
+        // 返回的資料會傳給所有頻道中的其他成員
+        // 這些資料可以在前端透過 member.info 取得
+        return [
+            'id' => $user->id,
+            'name' => $user->name,
+            'avatar' => $user->avatar_url,
+            'role' => $user->getRoleInRoom($roomId),
+        ];
+    }
+
+    return false;  // 拒絕訂閱
+});
+```
+
+**步驟 C：前端 — 完整 Presence 頻道使用**
+
+```javascript
+const presenceChannel = Echo.join(`room.${roomId}`);
+
+// ===== 成員管理事件（由 Sockudo 自動觸發） =====
+
+// 1. 訂閱成功 — 取得目前所有在線成員
+presenceChannel.here((members) => {
+    // members 是一個陣列，包含所有在線成員的資料
+    // 對應 Sockudo 回傳的 pusher_internal:subscription_succeeded
+    // data.presence.hash 中的資料
+    console.log('在線成員:', members);
+    // [
+    //   { id: 1, name: 'Alice', avatar: '...', role: 'admin' },
+    //   { id: 2, name: 'Bob', avatar: '...', role: 'member' },
+    // ]
+    updateOnlineUserList(members);
+});
+
+// 2. 新成員加入 — 對應 Sockudo 的 pusher_internal:member_added
+presenceChannel.joining((member) => {
+    console.log('加入:', member);
+    // { id: 3, name: 'Carol', avatar: '...', role: 'member' }
+    addToOnlineList(member);
+    showNotification(`${member.name} 已上線`);
+});
+
+// 3. 成員離開 — 對應 Sockudo 的 pusher_internal:member_removed
+presenceChannel.leaving((member) => {
+    console.log('離開:', member);
+    removeFromOnlineList(member);
+    showNotification(`${member.name} 已離線`);
+});
+
+// ===== 自訂事件（由後端 broadcast() 觸發） =====
+presenceChannel.listen('.status.changed', (e) => {
+    updateUserStatus(e.userId, e.status);
+});
+
+// ===== Client Event — 打字指示器 =====
+// whisper 不經過後端，直接由 Sockudo 轉發給其他成員
+presenceChannel.whisper('typing', {
+    user: currentUser.name,
+});
+
+presenceChannel.listenForWhisper('typing', (e) => {
+    showTypingIndicator(e.user);
+});
+```
+
+---
+
+#### 範例 4：Private Encrypted Channel — 端對端加密
+
+**情境**：需要端對端加密的敏感通訊，即使 Sockudo 伺服器也無法讀取訊息內容。
+
+> **注意**：加密頻道使用 `private-encrypted-` 前綴。Sockudo 會自動偵測此前綴並停用 Delta 壓縮（因為加密後的資料無法有效壓縮）。
+
+```php
+// Laravel Event — 使用加密頻道
+public function broadcastOn(): array
+{
+    // 頻道名稱加上 'private-encrypted-' 前綴
+    // Laravel 的 EncryptedPrivateChannel 會自動處理
+    return [
+        new \Illuminate\Broadcasting\EncryptedPrivateChannel("medical.{$this->patientId}"),
+    ];
+}
+```
+
+```php
+// routes/channels.php
+Broadcast::channel('medical.{patientId}', function ($user, $patientId) {
+    // 只有患者本人或其醫生可訂閱
+    return $user->id === (int) $patientId
+        || $user->isDoctorOf($patientId);
+});
+```
+
+```javascript
+// 前端 — 加密頻道的用法與普通私有頻道相同
+// pusher-js 會自動處理加密/解密
+Echo.encryptedPrivate(`medical.${patientId}`)
+    .listen('.record.updated', (e) => {
+        console.log('病歷更新:', e);
+    });
+```
+
+---
+
+#### 疑難排解
+
+**問題 1：訂閱私有頻道時出現 403 Forbidden**
+
+```
+原因：Laravel 的認證端點拒絕了請求
+排查步驟：
+1. 確認使用者已登入（session 或 token 認證有效）
+2. 確認 routes/channels.php 中的回呼邏輯正確
+3. 檢查 Laravel 的 CSRF 保護（API 路由可能不需要）
+```
+
+解決方案 — 確認認證路由已正確註冊：
+
+```php
+// app/Providers/BroadcastServiceProvider.php
+// Laravel 11+ 使用 bootstrap/app.php
+
+use Illuminate\Support\Facades\Broadcast;
+
+// 確認這行已啟用（預設在 BroadcastServiceProvider 中）
+Broadcast::routes(['middleware' => ['web']]);
+
+// 如果前端使用 API token（如 Sanctum），改為：
+Broadcast::routes(['middleware' => ['auth:sanctum']]);
+```
+
+**問題 2：Sockudo 回傳 `Auth signature mismatch`**
+
+```
+原因：Laravel 計算的簽名與 Sockudo 預期的不一致
+排查步驟：
+1. 確認 .env 中的 PUSHER_APP_KEY 和 PUSHER_APP_SECRET 
+   與 Sockudo 配置中的 App key/secret 完全一致
+2. 確認沒有多餘的空格或換行符號
+3. 確認 Sockudo 配置中的 App 已啟用（enabled: true）
+```
+
+**問題 3：前端 `Echo.private()` 沒有觸發認證請求**
+
+```
+原因：Laravel Echo 的認證端點配置不正確
+排查步驟：
+1. 確認 Echo 配置中的 authEndpoint 或 channelAuthorization.endpoint 正確
+2. 開啟瀏覽器開發者工具 Network 頁面，查看是否有 POST 請求到 /broadcasting/auth
+3. 如果使用 Sanctum，確認 CSRF cookie 已取得
+```
+
+前端認證端點設定：
+
+```javascript
+// Laravel Echo 預設使用 /broadcasting/auth
+// 如果需要自訂認證端點：
+window.Echo = new Echo({
+    broadcaster: 'pusher',
+    key: import.meta.env.VITE_PUSHER_APP_KEY,
+    wsHost: import.meta.env.VITE_PUSHER_HOST ?? 'localhost',
+    wsPort: import.meta.env.VITE_PUSHER_PORT ?? 6001,
+    forceTLS: false,
+    disableStats: true,
+    enabledTransports: ['ws', 'wss'],
+    cluster: 'mt1',
+
+    // 自訂認證設定
+    channelAuthorization: {
+        endpoint: '/broadcasting/auth',
+        transport: 'ajax',
+        headers: {
+            // Laravel Sanctum SPA 認證
+            'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]')?.content,
+            // 或使用 Bearer Token
+            // 'Authorization': `Bearer ${token}`,
+        },
+    },
+});
+```
+
+**問題 4：Presence 頻道的 `here()` 收到空陣列**
+
+```
+原因：channels.php 中的回呼返回了 true 而非陣列
+解決：Presence 頻道的回呼必須返回一個陣列（使用者資料），而非 boolean。
+```
+
+```php
+// ❌ 錯誤 — 這是 Private Channel 的寫法
+Broadcast::channel('room.{roomId}', function ($user, $roomId) {
+    return true;  // 不會包含使用者資料
+});
+
+// ✅ 正確 — Presence Channel 必須返回陣列
+Broadcast::channel('room.{roomId}', function ($user, $roomId) {
+    return [
+        'id' => $user->id,
+        'name' => $user->name,
+    ];
+});
+```
+
+---
+
+#### 頻道類型快速對照表
+
+| 特性 | Public | Private | Presence | Private Encrypted |
+|------|--------|---------|----------|-------------------|
+| Laravel 類別 | `Channel` | `PrivateChannel` | `PresenceChannel` | `EncryptedPrivateChannel` |
+| 頻道前綴 | 無 | `private-` | `presence-` | `private-encrypted-` |
+| 需要認證 | ❌ | ✅ | ✅ | ✅ |
+| 成員追蹤 | ❌ | ❌ | ✅ | ❌ |
+| Client Event | ❌ | ✅ | ✅ | ❌ |
+| 端對端加密 | ❌ | ❌ | ❌ | ✅ |
+| channels.php 返回值 | — | `true`/`false` | `array`/`false` | `true`/`false` |
+| Echo 訂閱方法 | `Echo.channel()` | `Echo.private()` | `Echo.join()` | `Echo.encryptedPrivate()` |
+| Sockudo 簽名字串 | — | `{sid}:{ch}` | `{sid}:{ch}:{data}` | `{sid}:{ch}` |
+| Delta 壓縮 | ✅ | ✅ | ✅ | ❌ 自動停用 |
 
 ---
 

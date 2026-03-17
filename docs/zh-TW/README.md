@@ -13,6 +13,7 @@ Sockudo 是一個用 Rust 編寫的高效能即時 WebSocket 伺服器，實作�
 | [完整配置參考](./CONFIGURATION.md) | 所有配置項目、環境變數、預設值的完整說明 |
 | [API 參考](./API_REFERENCE.md) | HTTP REST API 端點與 WebSocket 協議詳細文檔 |
 | [整合指南](./INTEGRATION.md) | Golang、PHP、Laravel、Rust 客戶端整合教學 |
+| ↳ [Laravel Private / Presence Channel](./INTEGRATION.md#31-laravel-private--presence-channel-深入教學) | Laravel 私有頻道與 Presence 頻道深入教學 |
 | [時序圖](./SEQUENCE_DIAGRAMS.md) | WebSocket 連線、頻道訂閱、認證等流程的時序圖 |
 
 ---
